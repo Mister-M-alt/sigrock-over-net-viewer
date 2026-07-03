@@ -264,32 +264,14 @@ static CaptureCfg parse_config(const json &j)
 
 // -------- Client handling ----------------------------------------------------
 
-// Wait until `fd` has data. Returns false if the listen socket has a pending
-// connection instead (new-client-wins: a fresh sonview replaces a stale one,
-// e.g. after a silent network partition left this socket half-open).
-static bool wait_readable(int fd, int srv)
-{
-    struct pollfd p[2] = {{fd, POLLIN, 0}, {srv, POLLIN, 0}};
-    for (;;) {
-        int rc = poll(p, 2, -1);
-        if (rc < 0) {
-            if (errno == EINTR)
-                continue;
-            return false;
-        }
-        if (p[1].revents & POLLIN)
-            return false; // yield to the new client
-        if (p[0].revents)
-            return true;
-    }
-}
-
-static void handle_client(int fd, int srv)
+static void handle_client(int fd)
 {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     // Detect silently-dead peers (cable pull, wifi drop) in ~15s so the accept
-    // loop can never be wedged by a half-open connection.
+    // loop can never be wedged by a half-open connection. A reconnecting client
+    // waits in the listen backlog for at most that long. (Deliberately NOT
+    // preempting on new connections: any stray SYN would kick a live session.)
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     int idle = 5, intvl = 3, cnt = 3;
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
@@ -320,7 +302,7 @@ static void handle_client(int fd, int srv)
     son_msg m;
     void *decode_state = nullptr;  // active post-hoc decode session
     int decode_unitsize = 1;
-    while (wait_readable(fd, srv) && son_recv(fd, m)) {
+    while (son_recv(fd, m)) {
         switch (m.hdr.type) {
         case SON_MSG_DECODE_REQ: {
             if (decode_state) { decode_end(decode_state, fd); decode_state = nullptr; }
@@ -440,7 +422,7 @@ static int run_server(int port)
         if (fd < 0) { if (errno == EINTR) continue; perror("accept"); break; }
         printf("client connected: %s\n", inet_ntoa(ca.sin_addr));
         fflush(stdout);
-        handle_client(fd, srv);
+        handle_client(fd);
         close(fd);
         printf("client disconnected\n");
         fflush(stdout);

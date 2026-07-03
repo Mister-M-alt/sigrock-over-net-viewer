@@ -7,6 +7,7 @@
 #include <string>
 
 #include "app.h"
+#include "icon_data.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_sdl2.h"
@@ -23,6 +24,9 @@ static std::string layout_ini_path() {
 }
 
 int run_gui(const std::string &default_host, bool autocapture, bool autoconnect) {
+    // Match the .desktop StartupWMClass so the running window groups with the
+    // pinned launcher entry (X11 WM_CLASS). Don't override a user's setting.
+    setenv("SDL_VIDEO_X11_WMCLASS", "sonview", 0);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -50,6 +54,14 @@ int run_gui(const std::string &default_host, bool autocapture, bool autoconnect)
         SDL_Quit();
         return 1;
     }
+    // window/taskbar icon (embedded RGBA; regenerate via scripts/gen-icon.sh)
+    SDL_Surface *icon = SDL_CreateRGBSurfaceWithFormatFrom(
+        (void *)ICON_RGBA, ICON_W, ICON_H, 32, ICON_W * 4, SDL_PIXELFORMAT_RGBA32);
+    if (icon) {
+        SDL_SetWindowIcon(window, icon);
+        SDL_FreeSurface(icon);
+    }
+
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
     if (!gl_context) {
         std::fprintf(stderr, "SDL_GL_CreateContext: %s\n", SDL_GetError());
@@ -75,7 +87,9 @@ int run_gui(const std::string &default_host, bool autocapture, bool autoconnect)
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     App app;
-    app.set_default_host(default_host);
+    // Only an explicit --connect overrides the persisted host: launching plain
+    // `sonview` must come up with the IP you used last time.
+    if (!default_host.empty()) app.set_default_host(default_host);
     if (autocapture) app.enable_autopilot();
     if (autoconnect) app.request_connect();
 
@@ -118,7 +132,9 @@ int run_gui(const std::string &default_host, bool autocapture, bool autoconnect)
             ImGuiID center = dsid;
             ImGuiID left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.24f, nullptr, &center);
             ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.26f, nullptr, &center);
-            ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.26f, nullptr, &center);
+            ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.22f, nullptr, &center);
+            ImGuiID scope = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.34f, nullptr, &center);
+            ImGui::DockBuilderDockWindow("Scope", scope);
             ImGui::DockBuilderDockWindow("Connection", left);
             ImGui::DockBuilderDockWindow("Device", left);
             ImGui::DockBuilderDockWindow("Decoders", left);

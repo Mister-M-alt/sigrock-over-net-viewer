@@ -33,7 +33,7 @@ static ImU32 chan_color(int index, bool analog) {
 }
 
 void App::view_fit(float canvas_w) {
-    uint64_t total = logic_.count(), fl = logic_.first_live();
+    uint64_t total = logic().count(), fl = logic().first_live();
     if (total <= fl) return;
     view_start_ = (double)fl;
     spp_ = std::max(1.0 / 64.0, (double)(total - fl) / std::max(1.0f, canvas_w));
@@ -54,7 +54,7 @@ bool App::nearest_edge(int bit, double s, double window, double &edge) const {
     uint64_t hi = (uint64_t)(s + window) + 1;
     std::vector<Edge> edges;
     uint8_t init;
-    logic_.walk(bit, lo, hi, 1.0, init, edges, nullptr);
+    logic().walk(bit, lo, hi, 1.0, init, edges, nullptr);
     bool found = false;
     double best = 0, bestd = 0;
     for (auto &e : edges) {
@@ -100,8 +100,9 @@ static std::string fmt_grid(double value, double step) {
 void App::clamp_view(float canvas_w) {
     if (spp_ < 1.0 / 64.0) spp_ = 1.0 / 64.0;
     if (spp_ > 1e9) spp_ = 1e9;
-    double firstlive = (double)logic_.first_live();
-    double total = (double)logic_.count();
+    double firstlive = (double)logic().first_live();
+    double total = (double)logic().count();
+    if (view_total_hint_ > total) total = view_total_hint_;
     // Don't zoom out past ~1.5x the capture: endless mouse-wheel-out recovery
     // is pure frustration.
     if (total > firstlive) {
@@ -147,14 +148,14 @@ void App::draw_logic_row(void *d, const ChannelInfo &ch, float x0, float x1,
     float yhi = y_top + 3, ylo = y_bot - 3;
     auto yv = [&](uint8_t v) { return v ? yhi : ylo; };
 
-    double lo = std::max(view_start_, (double)logic_.first_live());
+    double lo = std::max(view_start_, (double)logic().first_live());
     double right = view_start_ + (double)(x1 - x0) * spp_;
-    double hi = std::min(right, (double)logic_.count());
+    double hi = std::min(right, (double)logic().count());
     if (hi <= lo) return;
 
     std::vector<Edge> edges;
     uint8_t init = 0;
-    logic_.walk(bit, (uint64_t)lo, (uint64_t)std::ceil(hi), spp_, init, edges, nullptr);
+    logic().walk(bit, (uint64_t)lo, (uint64_t)std::ceil(hi), spp_, init, edges, nullptr);
 
     ImU32 col = chan_color(ch.index, false);
     std::vector<ImVec2> pts;
@@ -182,7 +183,7 @@ void App::draw_logic_row(void *d, const ChannelInfo &ch, float x0, float x1,
     pts.push_back(ImVec2((float)x_of(hi, x0), yv(cur)));
     dl->AddPolyline(pts.data(), (int)pts.size(), col, 0, 1.5f);
 
-    for (uint64_t g : logic_.gaps()) {
+    for (uint64_t g : logic().gaps()) {
         if ((double)g > lo && (double)g < hi) {
             float gx = (float)x_of((double)g, x0);
             dl->AddLine(ImVec2(gx, y_top), ImVec2(gx, y_bot), IM_COL32(210, 70, 70, 160), 1.5f);
@@ -193,7 +194,7 @@ void App::draw_logic_row(void *d, const ChannelInfo &ch, float x0, float x1,
 void App::draw_analog_row(void *d, const ChannelInfo &ch, float x0, float x1,
                           float y_top, float y_bot) {
     ImDrawList *dl = (ImDrawList *)d;
-    AnalogStore *as = analog_get((uint32_t)ch.index, false);
+    AnalogStore *as = analog_get((uint32_t)ch.index);
     if (!as) return;
     double lo = std::max(view_start_, 0.0);
     double right = view_start_ + (double)(x1 - x0) * spp_;
@@ -260,7 +261,7 @@ void App::draw_ann_rows(void *d, float x0, float x1, float &y) {
             dl->AddText(ImVec2(x0 - LABEL_W + 2, y + 2), labelc, lab.c_str());
             // visit() draws in place: no per-frame copy of the whole row, and
             // the binary search culls to the visible span. (A4 perf fix.)
-            anns_.visit(dr.stack_id, (uint16_t)row.first, (uint64_t)std::max(0.0, lo),
+            anns().visit(dr.stack_id, (uint16_t)row.first, (uint64_t)std::max(0.0, lo),
                         (uint64_t)std::max(0.0, right), [&](const Annotation &an) {
                 float ax = (float)x_of((double)an.start, x0);
                 float bx = (float)x_of((double)an.end, x0);
@@ -355,6 +356,7 @@ void App::draw_canvas_panel() {
     float canvas_w = std::max(1.0f, x1 - x0);
 
     last_canvas_w_ = canvas_w;
+    view_total_hint_ = (capturing_ || meta_pending_.load()) ? (double)meta.total_samples : 0.0;
     ImGui::InvisibleButton("canvas", ImVec2(avail.x, avail.y));
     bool hovered = ImGui::IsItemHovered();
     ImGuiIO &io = ImGui::GetIO();
@@ -362,7 +364,7 @@ void App::draw_canvas_panel() {
 
     // view init / follow
     if (need_view_reset_.exchange(false)) view_init_ = false;
-    uint64_t total = logic_.count();
+    uint64_t total = logic().count();
     if (!view_init_ && total > 0) view_fit(canvas_w);
 
     // display order + auto row height: shrink rows (down to 18 px) so all
@@ -402,7 +404,7 @@ void App::draw_canvas_panel() {
         bool moved = false;
         if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) { view_start_ -= pan; moved = true; }
         if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) { view_start_ += pan; moved = true; }
-        if (ImGui::IsKeyPressed(ImGuiKey_Home)) { view_start_ = (double)logic_.first_live(); moved = true; }
+        if (ImGui::IsKeyPressed(ImGuiKey_Home)) { view_start_ = (double)logic().first_live(); moved = true; }
         if (ImGui::IsKeyPressed(ImGuiKey_End)) { view_start_ = (double)total - canvas_w * spp_; moved = true; }
         if (ImGui::IsKeyPressed(ImGuiKey_F)) { view_fit(canvas_w); moved = true; }
         double zoom = 0;
@@ -528,9 +530,9 @@ void App::draw_canvas_panel() {
             if (ch->type == "logic" && ch->bit >= 0) {
                 std::snprintf(hb, sizeof(hb), "%s | %s = %d", fmt_time(s / sr_h).c_str(),
                               chan_name(ch->index, ch->name).c_str(),
-                              (int)logic_.bit(ch->bit, (uint64_t)s));
+                              (int)logic().bit(ch->bit, (uint64_t)s));
             } else {
-                AnalogStore *as = analog_get((uint32_t)ch->index, false);
+                AnalogStore *as = analog_get((uint32_t)ch->index);
                 std::snprintf(hb, sizeof(hb), "%s | %s = %.4g", fmt_time(s / sr_h).c_str(),
                               chan_name(ch->index, ch->name).c_str(),
                               as ? as->value((uint64_t)s) : 0.0f);
@@ -553,6 +555,381 @@ void App::draw_canvas_panel() {
                   spp_, fmt_time(canvas_w * spp_ / sr2).c_str(),
                   (unsigned long long)total, fmt_time((double)total / sr2).c_str());
     dl->AddText(ImVec2(x0 + 6, y_bottom - 16), IM_COL32(180, 180, 190, 220), ov);
+
+    ImGui::End();
+}
+
+// ---- oscilloscope view -----------------------------------------------------
+static float snap125(float v) {  // round up to the classic 1-2-5 sequence
+    if (v <= 0) return 1.0f;
+    float mag = std::pow(10.0f, std::floor(std::log10(v)));
+    float n = v / mag;
+    float s = n <= 1.0f ? 1.0f : n <= 2.0f ? 2.0f : n <= 5.0f ? 5.0f : 10.0f;
+    return s * mag;
+}
+
+static std::string fmt_volts(float v) {
+    char b[32];
+    float a = std::fabs(v);
+    if (a > 0 && a < 1.0f) std::snprintf(b, sizeof(b), "%g mV", v * 1000.0f);
+    else std::snprintf(b, sizeof(b), "%g V", v);
+    return b;
+}
+
+// Fit a channel: center on the visible mid, ~6 of 8 divisions of swing.
+void App::scope_autofit(int chan_index, ScopeChan &sc) {
+    AnalogStore *as = analog_get((uint32_t)chan_index);
+    if (!as || as->count() == 0) return;
+    uint64_t lo = (uint64_t)std::max(view_start_, 0.0);
+    uint64_t hi = std::min<uint64_t>(as->count(), (uint64_t)(view_start_ + last_canvas_w_ * spp_));
+    if (hi <= lo) { lo = 0; hi = as->count(); }
+    uint64_t stride = std::max<uint64_t>(1, (hi - lo) / 4096);
+    float mn = 1e30f, mx = -1e30f;
+    for (uint64_t s = lo; s < hi; s += stride) {
+        float v = as->value(s);
+        mn = std::min(mn, v);
+        mx = std::max(mx, v);
+    }
+    if (mx <= mn) { mn -= 1; mx += 1; }
+    sc.voff = (mn + mx) * 0.5f;
+    sc.vdiv = snap125((mx - mn) / 6.0f);
+    sc.inited = true;
+}
+
+void App::draw_scope_panel() {
+    ImGui::Begin("Scope");
+    SessionMeta meta = meta_copy();
+    double sr = render_sr_ > 0 ? render_sr_ : 1.0;
+
+    std::vector<const ChannelInfo *> achs, dchs;
+    for (const ChannelInfo *ch : ordered_channels(meta)) {
+        if (ch->type == "analog") achs.push_back(ch);
+        else if (ch->type == "logic" && ch->bit >= 0) dchs.push_back(ch);
+    }
+    if (achs.empty() && dchs.empty()) {
+        ImGui::TextDisabled("no channels in this capture");
+        ImGui::End();
+        return;
+    }
+
+    // ---- per-channel control strip (the usual scope knobs) ----
+    static const float VDIVS[] = {0.001f, 0.002f, 0.005f, 0.01f, 0.02f, 0.05f,
+                                  0.1f,   0.2f,   0.5f,   1.f,   2.f,   5.f,
+                                  10.f,   20.f,   50.f};
+    float ctl_h = (achs.empty() || dchs.empty()) ? 34.0f : 62.0f;
+    ImGui::BeginChild("scopectl", ImVec2(0, ctl_h), false, ImGuiWindowFlags_HorizontalScrollbar);
+    for (size_t ci = 0; ci < achs.size(); ++ci) {
+        const ChannelInfo *ch = achs[ci];
+        ScopeChan &sc = scope_[ch->index];
+        ImGui::PushID(ch->index);
+        if (ci) ImGui::SameLine(0, 18);
+        ImGui::Checkbox("##v", &sc.show);
+        ImGui::SameLine(0, 3);
+        ImU32 c = chan_color(ch->index, true);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(c), "%s",
+                           chan_name(ch->index, ch->name).c_str());
+        ImGui::SameLine(0, 6);
+        ImGui::SetNextItemWidth(76);
+        std::string cur = fmt_volts(sc.vdiv) + "/div";
+        if (ImGui::BeginCombo("##vdiv", cur.c_str())) {
+            for (float v : VDIVS)
+                if (ImGui::Selectable((fmt_volts(v) + "/div").c_str(), v == sc.vdiv))
+                    sc.vdiv = v;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine(0, 3);
+        ImGui::SetNextItemWidth(64);
+        ImGui::DragFloat("##voff", &sc.voff, sc.vdiv * 0.05f, 0, 0, "%.3g V");
+        ImGui::SetItemTooltip("Vertical offset (voltage at center)");
+        ImGui::SameLine(0, 3);
+        if (ImGui::SmallButton("A")) scope_autofit(ch->index, sc);
+        ImGui::SetItemTooltip("Auto-fit scale/offset to the visible data");
+        ImGui::SameLine(0, 3);
+        ImGui::Checkbox("AC", &sc.ac);
+        ImGui::SetItemTooltip("AC coupling: subtract the visible-window mean");
+        ImGui::PopID();
+    }
+    // digital channel knobs (MSO style): position + size, in divisions
+    for (size_t ci = 0; ci < dchs.size(); ++ci) {
+        const ChannelInfo *ch = dchs[ci];
+        ScopeDig &sd = scope_d_[ch->index];
+        if (!sd.inited) {  // stack from the top of the graticule downward
+            sd.pos = 3.6f - 0.42f * (float)ci;
+            sd.inited = true;
+        }
+        ImGui::PushID(1000 + ch->index);
+        if (ci) ImGui::SameLine(0, 14);
+        ImGui::Checkbox("##v", &sd.show);
+        ImGui::SameLine(0, 3);
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(chan_color(ch->index, false)), "%s",
+                           chan_name(ch->index, ch->name).c_str());
+        ImGui::SameLine(0, 4);
+        ImGui::SetNextItemWidth(56);
+        ImGui::DragFloat("##pos", &sd.pos, 0.05f, -4.0f, 4.0f, "%.2f d");
+        ImGui::SetItemTooltip("Vertical position (divisions above center)");
+        ImGui::SameLine(0, 3);
+        ImGui::SetNextItemWidth(48);
+        ImGui::DragFloat("##sz", &sd.size, 0.02f, 0.1f, 2.0f, "%.2f");
+        ImGui::SetItemTooltip("Trace height (divisions)");
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    // ---- graticule + traces, time-locked to the waveform view ----
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x < 60 + LABEL_W || avail.y < 40) { ImGui::End(); return; }
+    // Same left gutter as the waveform view so time columns line up vertically.
+    float x0 = p0.x + LABEL_W, x1 = p0.x + avail.x;
+    float y0 = p0.y, y1 = p0.y + avail.y;
+    float w = x1 - x0;
+
+    ImGui::InvisibleButton("scopecanvas", avail);
+    bool hovered = ImGui::IsItemHovered();
+    ImGuiIO &io = ImGui::GetIO();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+
+    // trigger-position cursor (the SETTING for the next acquisition): a scope-
+    // style flag at the top edge, draggable to adjust the pre-trigger %.
+    bool trig_ui = false;
+    uint64_t trig_fl = logic().first_live();
+    // Map the pre-trigger % onto the record on screen: the delivered samples,
+    // capped by the configured acquisition length (devices can under-deliver).
+    uint64_t trig_have = logic().count() > trig_fl ? logic().count() - trig_fl : 0;
+    uint64_t trig_tot = trig_have;
+    if (meta.total_samples && meta.total_samples < trig_tot) trig_tot = meta.total_samples;
+    if (mode_idx_ == 0 && trig_tot > 0 && sel_dev_ >= 0 && sel_dev_ < (int)devices_.size())
+        for (auto &ch : devices_[sel_dev_].channels)
+            if (ch.enabled && ch.trigger != "none" && !ch.trigger.empty()) trig_ui = true;
+    auto trig_x = [&]() {
+        return (float)x_of((double)trig_fl + capture_ratio_ / 100.0 * (double)trig_tot, x0);
+    };
+
+    // shared pan/zoom (same time axis as the waveform view)
+    if (hovered || scope_trig_drag_) {
+        float mx = io.MousePos.x;
+        if (trig_ui && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            std::fabs(mx - trig_x()) <= 8.0f && io.MousePos.y <= y0 + 16.0f)
+            scope_trig_drag_ = true;
+        if (scope_trig_drag_ && trig_tot > 0) {
+            double s = sample_of((double)mx, x0);
+            int r = (int)std::lround((s - (double)trig_fl) / (double)trig_tot * 100.0);
+            capture_ratio_ = std::max(0, std::min(99, r));
+            if (ImGui::IsMouseReleased(ImGuiMouseButton_Left)) scope_trig_drag_ = false;
+        }
+    }
+    if (hovered && !scope_trig_drag_) {
+        if (io.MouseWheel != 0.0f) {
+            double m = sample_of((double)io.MousePos.x, x0);
+            spp_ *= std::pow(0.82, io.MouseWheel);
+            if (spp_ < 1.0 / 64.0) spp_ = 1.0 / 64.0;
+            view_start_ = m - (double)(io.MousePos.x - x0) * spp_;
+            follow_ = false;
+            user_view_touched_ = true;
+        }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Left) ||
+            ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            view_start_ -= (double)io.MouseDelta.x * spp_;
+            follow_ = false;
+            user_view_touched_ = true;
+        }
+    }
+    clamp_view(w);
+
+    // background + graticule: 8 vertical divisions, time grid shared with the
+    // waveform view so both stay visually aligned.
+    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(12, 13, 17, 255));
+    dl->AddRectFilled(p0, ImVec2(x0, y1), IM_COL32(30, 30, 36, 255));  // gutter
+    float div_h = avail.y / 8.0f;
+    for (int i = 1; i < 8; ++i) {
+        ImU32 gc = (i == 4) ? IM_COL32(80, 84, 100, 255) : IM_COL32(42, 45, 56, 255);
+        dl->AddLine(ImVec2(x0, y0 + i * div_h), ImVec2(x1, y0 + i * div_h), gc, 1.0f);
+    }
+    dl->PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1), true);
+    draw_time_grid(dl, x0, x1, y0, y1);
+
+    // traces
+    for (auto *ch : achs) {
+        ScopeChan &sc = scope_[ch->index];
+        AnalogStore *as = analog_get((uint32_t)ch->index);
+        if (!as || as->count() == 0) continue;
+        if (!sc.inited) scope_autofit(ch->index, sc);
+        if (!sc.show) continue;
+
+        double lo = std::max(view_start_, 0.0);
+        double right = view_start_ + (double)w * spp_;
+        double hi = std::min(right, (double)as->count());
+        if (hi <= lo) continue;
+
+        float mean = 0.0f;
+        if (sc.ac) {
+            uint64_t stride = std::max<uint64_t>(1, (uint64_t)((hi - lo) / 2048));
+            double sum = 0;
+            uint64_t n = 0;
+            for (uint64_t s = (uint64_t)lo; s < (uint64_t)hi; s += stride) {
+                sum += as->value(s);
+                ++n;
+            }
+            if (n) mean = (float)(sum / (double)n);
+        }
+        float mid = (y0 + y1) * 0.5f;
+        auto ymap = [&](float v) {
+            float y = mid - ((v - mean) - sc.voff) / sc.vdiv * div_h;
+            return std::max(y0 + 1, std::min(y1 - 1, y));
+        };
+        ImU32 c = chan_color(ch->index, true);
+
+        // ground (0 V) marker on the left edge
+        float gy = ymap(0.0f);
+        dl->AddTriangleFilled(ImVec2(x0, gy - 4), ImVec2(x0, gy + 4), ImVec2(x0 + 6, gy), c);
+
+        float prev_mx_y = 0;
+        bool have_prev = false;
+        int px0 = (int)std::floor(x0), px1 = (int)std::ceil(x1);
+        for (int px = px0; px < px1; ++px) {
+            double s0 = sample_of((double)px, x0);
+            double s1 = sample_of((double)px + 1.0, x0);
+            if (s1 <= lo || s0 >= hi) continue;
+            float mn, mx;
+            if (spp_ >= 16.0) {
+                if (!as->envelope((uint64_t)std::max(s0, lo), spp_, mn, mx)) continue;
+            } else {
+                uint64_t a = (uint64_t)std::max(s0, lo);
+                uint64_t b = (uint64_t)std::min(s1, hi);
+                if (b <= a) b = a + 1;
+                mn = 1e30f;
+                mx = -1e30f;
+                for (uint64_t s = a; s < b; ++s) {
+                    float v = as->value(s);
+                    mn = std::min(mn, v);
+                    mx = std::max(mx, v);
+                }
+            }
+            float ymn = ymap(mn), ymx = ymap(mx);
+            dl->AddLine(ImVec2((float)px, ymn), ImVec2((float)px, ymx), c, 1.2f);
+            if (have_prev)
+                dl->AddLine(ImVec2((float)px - 1, prev_mx_y), ImVec2((float)px, ymn), c, 1.2f);
+            prev_mx_y = ymx;
+            have_prev = true;
+        }
+    }
+
+    // digital traces (MSO): edge walk like the time view, placed on the graticule
+    for (auto *ch : dchs) {
+        ScopeDig &sd = scope_d_[ch->index];
+        if (!sd.show) continue;
+        float mid = (y0 + y1) * 0.5f;
+        float ylo = mid - sd.pos * div_h;
+        float yhi = ylo - sd.size * div_h;
+        auto yv = [&](uint8_t v) { return v ? yhi : ylo; };
+
+        double lo = std::max(view_start_, (double)logic().first_live());
+        double right = view_start_ + (double)w * spp_;
+        double hi = std::min(right, (double)logic().count());
+        if (hi <= lo) continue;
+        std::vector<Edge> edges;
+        uint8_t init = 0;
+        logic().walk(ch->bit, (uint64_t)lo, (uint64_t)std::ceil(hi), spp_, init, edges, nullptr);
+
+        ImU32 c = chan_color(ch->index, false);
+        std::vector<ImVec2> pts;
+        pts.reserve(edges.size() * 4 + 4);
+        uint8_t cur = init;
+        pts.push_back(ImVec2((float)x_of(lo, x0), yv(cur)));
+        size_t i = 0;
+        while (i < edges.size()) {
+            float ex = (float)x_of((double)edges[i].sample, x0);
+            float bucket = std::floor(ex);
+            uint8_t endval = cur;
+            size_t j = i;
+            while (j < edges.size() &&
+                   std::floor((float)x_of((double)edges[j].sample, x0)) == bucket) {
+                endval = edges[j].value;
+                ++j;
+            }
+            pts.push_back(ImVec2(ex, yv(cur)));
+            pts.push_back(ImVec2(ex, yhi));
+            pts.push_back(ImVec2(ex, ylo));
+            pts.push_back(ImVec2(ex, yv(endval)));
+            cur = endval;
+            i = j;
+        }
+        pts.push_back(ImVec2((float)x_of(hi, x0), yv(cur)));
+        dl->AddPolyline(pts.data(), (int)pts.size(), c, 0, 1.3f);
+        // channel tag at the left edge of the trace
+        dl->AddText(ImVec2(x0 + 3, (yhi + ylo) * 0.5f - 7), c,
+                    chan_name(ch->index, ch->name).c_str());
+    }
+
+    // fired-trigger line (where the CURRENT acquisition actually triggered)
+    if (has_trigger_.load()) {
+        float tx = (float)x_of((double)trigger_sample_.load(), x0);
+        if (tx >= x0 && tx <= x1) {
+            dl->AddLine(ImVec2(tx, y0), ImVec2(tx, y1), IM_COL32(255, 120, 60, 130), 1.5f);
+        }
+    }
+
+    // hover readout: time + each visible channel's value at the cursor
+    if (hovered && io.MousePos.x >= x0) {
+        double s = sample_of((double)io.MousePos.x, x0);
+        dl->AddLine(ImVec2(io.MousePos.x, y0), ImVec2(io.MousePos.x, y1),
+                    IM_COL32(200, 200, 210, 60), 1.0f);
+        std::string hb = fmt_time(s / sr);
+        for (auto *ch : achs) {
+            ScopeChan &sc = scope_[ch->index];
+            AnalogStore *as = analog_get((uint32_t)ch->index);
+            if (!sc.show || !as || (uint64_t)s >= as->count() || s < 0) continue;
+            hb += "  " + chan_name(ch->index, ch->name) + "=" +
+                  fmt_volts(as->value((uint64_t)s));
+        }
+        for (auto *ch : dchs) {
+            ScopeDig &sd = scope_d_[ch->index];
+            if (!sd.show || s < 0 || (uint64_t)s >= logic().count()) continue;
+            hb += "  " + chan_name(ch->index, ch->name) + "=" +
+                  std::to_string((int)logic().bit(ch->bit, (uint64_t)s));
+        }
+        ImVec2 sz = ImGui::CalcTextSize(hb.c_str());
+        float hx = io.MousePos.x + 12, hy = y0 + 4;
+        if (hx + sz.x + 6 > x1) hx = io.MousePos.x - sz.x - 12;
+        dl->AddRectFilled(ImVec2(hx - 3, hy - 2), ImVec2(hx + sz.x + 3, hy + sz.y + 2),
+                          IM_COL32(8, 8, 12, 220));
+        dl->AddText(ImVec2(hx, hy), IM_COL32(235, 235, 245, 255), hb.c_str());
+    }
+
+    // draggable trigger-position flag (setting for the NEXT acquisition) —
+    // drawn last so nothing (traces, hover box) can paint over the handle.
+    if (trig_ui) {
+        float tx = trig_x();
+        if (tx >= x0 - 8 && tx <= x1 + 8) {
+            ImU32 tc = IM_COL32(255, 150, 60, 255);
+            dl->AddLine(ImVec2(tx, y0), ImVec2(tx, y1), IM_COL32(255, 150, 60, 70), 1.0f);
+            dl->AddTriangleFilled(ImVec2(tx - 7, y0), ImVec2(tx + 7, y0), ImVec2(tx, y0 + 11), tc);
+            dl->AddText(ImVec2(tx - 3, y0 - 1), IM_COL32(20, 20, 24, 255), "T");
+            bool near = hovered && std::fabs(io.MousePos.x - tx) <= 8.0f &&
+                        io.MousePos.y <= y0 + 16.0f;
+            if (near || scope_trig_drag_)
+                ImGui::SetTooltip("trigger position: %d%% pre-trigger\n"
+                                  "(drag; applies to the next acquisition)",
+                                  capture_ratio_);
+        }
+    }
+
+    dl->PopClipRect();
+
+    // per-channel scale legend in the left gutter (out of the traces' way)
+    float ly = y0 + 4;
+    for (auto *ch : achs) {
+        ScopeChan &sc = scope_[ch->index];
+        if (!sc.show) continue;
+        char lb[96];
+        std::snprintf(lb, sizeof(lb), "%s %s/div", chan_name(ch->index, ch->name).c_str(),
+                      fmt_volts(sc.vdiv).c_str());
+        dl->AddText(ImVec2(p0.x + 4, ly), chan_color(ch->index, true), lb);
+        char lb2[48];
+        std::snprintf(lb2, sizeof(lb2), "  @ %s", fmt_volts(sc.voff).c_str());
+        dl->AddText(ImVec2(p0.x + 4, ly + 13), IM_COL32(150, 150, 162, 255), lb2);
+        ly += 29;
+    }
 
     ImGui::End();
 }

@@ -37,20 +37,38 @@ code fits together.
 - Triggered (fixed length) and continuous (rolling) capture modes.
 - Pre-trigger capture (`capture_ratio`), an "armed, waiting for trigger"
   status, a trigger point marker on the canvas, capture progress, and a Repeat
-  mode that re-arms automatically.
+  mode that re-arms automatically. The trigger position is also a draggable
+  "T" flag along the top of the Scope view (like a bench scope); dragging it
+  sets the pre-trigger percentage for the next acquisition.
+- Repeat behaves like a scope's Run/Stop: the button stays "Stop" for the whole
+  run (it never flips back to Start between acquisitions), and the display is
+  double-buffered — each new acquisition fills a hidden buffer and swaps in
+  atomically when complete, so the screen never blinks or shows a half-drawn
+  trace. An acquisition counter shows progress.
 - Starting a new capture keeps the previous one until new data actually
-  arrives.
+  arrives; an acquisition that never triggers leaves the display untouched.
 
 ### Viewing
 - Logic and analog channels. Smooth pan and zoom over millions of samples,
   backed by a transition-OR mip pyramid, so short glitches stay visible when
   zoomed far out.
 - The timebase rescales with zoom (ns up to s), with a live samples-per-pixel
-  and span readout.
+  and span readout. The zoom/position persists across captures — taking new
+  data never resets the view (View -> Zoom to fit / F when you want it);
+  auto-fit happens only for the first data of a session.
 - Channels can be renamed and reordered. Rows shrink automatically so every
   channel and decode lane stays visible. Per-channel trace colors. Analog rows
   show min and max scale labels.
+- Oscilloscope view (Scope panel below the time view; toggle in the View menu),
+  MSO style: analog AND digital channels on an 8-division graticule, time-locked
+  to the waveform view. Analog channels get visibility, volts/div (1-2-5 steps),
+  vertical offset, AC coupling and auto-fit, plus 0 V ground markers; digital
+  channels get visibility, vertical position and trace size (in divisions),
+  auto-stacked from the top by default. Voltage/logic hover readout; all scales
+  persisted per device.
 - Hover readout shows the time and the value of the channel under the cursor.
+- The View menu selects which instruments are shown: Waveform view, Scope
+  view, or both (at least one stays visible). The choice persists.
 - Keyboard: Space starts or stops, F fits, arrow keys pan, + and - zoom,
   Home and End jump to the ends.
 - Docked, resizable IDE-style layout with a menu bar.
@@ -104,6 +122,13 @@ code fits together.
 
 Requires SDL2 and OpenGL dev packages. Dear ImGui is a git submodule in
 `third_party/imgui` (docking branch); nlohmann/json is vendored.
+
+Optional desktop integration (launcher entry + icon, puts `sonview` on PATH):
+```
+cmake --install build --prefix ~/.local
+```
+The window/taskbar icon is embedded in the binary; regenerate it from
+`assets/icon.svg` with `scripts/gen-icon.sh`.
 
 ```
 git submodule update --init        # first build only (or clone with --recursive)

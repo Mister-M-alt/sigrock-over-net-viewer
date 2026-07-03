@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=sonview
+GenericName=Remote Logic Analyzer
+Comment=Saleae-style logic analyzer viewer for sigrok over the network
+Exec=sonview
+Icon=sonview
+Terminal=false
+Categories=Development;Electronics;Engineering;
+Keywords=logic;analyzer;sigrok;waveform;oscilloscope;protocol;decoder;
+StartupWMClass=sonview

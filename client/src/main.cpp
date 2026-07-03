@@ -18,7 +18,7 @@ int run_gui(const std::string &default_host, bool autocapture, bool autoconnect)
 }  // namespace son
 
 int main(int argc, char **argv) {
-    std::string host = "127.0.0.1";
+    std::string host;  // empty = use the persisted host from the config
     bool autocapture = false;
     bool autoconnect = false;
     for (int i = 1; i < argc; ++i) {

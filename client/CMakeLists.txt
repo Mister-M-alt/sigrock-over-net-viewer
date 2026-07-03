@@ -26,3 +26,14 @@ target_include_directories(sonview PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(sonview PRIVATE
     son_proto imgui PkgConfig::SDL2 PkgConfig::ZSTD OpenGL::GL ${CMAKE_DL_LIBS} pthread)
 target_compile_options(sonview PRIVATE -Wall -Wextra)
+
+# Desktop integration: `cmake --install build --prefix ~/.local` puts the
+# binary on PATH and the icon/.desktop where launchers look for them.
+install(TARGETS sonview RUNTIME DESTINATION bin)
+install(FILES ${CMAKE_SOURCE_DIR}/assets/sonview.desktop
+        DESTINATION share/applications)
+foreach(sz 16 32 48 64 128 256)
+    install(FILES ${CMAKE_SOURCE_DIR}/assets/icon-${sz}.png
+            DESTINATION share/icons/hicolor/${sz}x${sz}/apps
+            RENAME sonview.png)
+endforeach()

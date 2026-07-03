@@ -98,9 +98,9 @@ std::string samplerate_str(uint64_t hz) {
 // sigrok session archive: readable by PulseView / sigrok-cli (-i file.sr).
 bool App::export_sr(const std::string &path, std::string &err) {
     SessionMeta m = meta_copy();
-    uint64_t fl = logic_.first_live(), total = logic_.count();
+    uint64_t fl = logic().first_live(), total = logic().count();
     if (total <= fl) { err = "no logic data captured"; return false; }
-    int unitsize = logic_.unitsize() ? logic_.unitsize() : 1;
+    int unitsize = logic().unitsize() ? logic().unitsize() : 1;
 
     std::vector<const ChannelInfo *> logic_chs;
     for (auto &ch : m.channels)
@@ -126,7 +126,7 @@ bool App::export_sr(const std::string &path, std::string &err) {
     for (uint64_t s = fl; s < total; s += CHUNK) {
         uint32_t n = (uint32_t)std::min<uint64_t>(CHUNK, total - s);
         buf.resize((size_t)n * unitsize);
-        logic_.copy_raw(s, n, buf.data());
+        logic().copy_raw(s, n, buf.data());
         z.add("logic-1-" + std::to_string(idx++), buf.data(), buf.size());
     }
     z.close();
@@ -136,7 +136,7 @@ bool App::export_sr(const std::string &path, std::string &err) {
 // Value-change dump: logic channels, ps timescale (exact for any samplerate).
 bool App::export_vcd(const std::string &path, std::string &err) {
     SessionMeta m = meta_copy();
-    uint64_t fl = logic_.first_live(), total = logic_.count();
+    uint64_t fl = logic().first_live(), total = logic().count();
     if (total <= fl) { err = "no logic data captured"; return false; }
     if (m.samplerate == 0) { err = "unknown samplerate"; return false; }
 
@@ -175,7 +175,7 @@ bool App::export_vcd(const std::string &path, std::string &err) {
     std::vector<std::vector<Edge>> edges(chs.size());
     std::vector<uint8_t> init(chs.size());
     for (size_t i = 0; i < chs.size(); ++i)
-        logic_.walk(chs[i]->bit, fl, total, 1.0, init[i], edges[i], nullptr);
+        logic().walk(chs[i]->bit, fl, total, 1.0, init[i], edges[i], nullptr);
 
     std::fprintf(f, "#%llu\n", (unsigned long long)(fl * ps_per_sample));
     for (size_t i = 0; i < chs.size(); ++i)

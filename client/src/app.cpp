@@ -104,11 +104,16 @@ static std::string fmt_hz(uint64_t hz) {
 
 static const char *kTrig[] = {"none", "0", "1", "rising", "falling", "edge"};
 
-App::App() { load_settings(); }
+App::App() {
+    bufs_[0] = std::make_unique<CaptureBuf>();
+    bufs_[1] = std::make_unique<CaptureBuf>();
+    load_settings();
+}
 App::~App() {
     save_settings();
     do_disconnect();
-    for (auto &kv : analog_map_) delete kv.second;
+    for (auto &b : bufs_)
+        for (auto &kv : b->analog) delete kv.second;
 }
 
 std::string App::window_title() const {
@@ -127,6 +132,7 @@ void App::set_default_host(const std::string &host) {
 }
 
 void App::log(const std::string &s) {
+    fprintf(stderr, "[sonview] %s\n", s.c_str());  // tee for headless runs/debugging
     std::lock_guard<std::mutex> lk(m_);
     log_.push_back(s);
     if (log_.size() > 500) log_.erase(log_.begin(), log_.begin() + (log_.size() - 500));
@@ -177,6 +183,19 @@ void App::harvest_device_prefs() {
     p["manual_rate_on"] = manual_rate_on_;
     p["manual_rate_hz"] = manual_rate_hz_;
     p["order"] = chan_order_;
+    json sj = json::object();
+    for (auto &kv : scope_)
+        sj[std::to_string(kv.first)] = {{"show", kv.second.show},
+                                        {"ac", kv.second.ac},
+                                        {"vdiv", kv.second.vdiv},
+                                        {"voff", kv.second.voff}};
+    p["scope"] = sj;
+    json dj = json::object();
+    for (auto &kv : scope_d_)
+        dj[std::to_string(kv.first)] = {{"show", kv.second.show},
+                                        {"pos", kv.second.pos},
+                                        {"size", kv.second.size}};
+    p["scope_d"] = dj;
     device_prefs_[dev_key(d)] = p;
 }
 
@@ -214,6 +233,8 @@ void App::save_settings() {
     j["max_window_msamples"] = max_window_msamples_;
     j["capture_ratio"] = capture_ratio_;
     j["repeat_capture"] = repeat_capture_;
+    j["show_scope"] = show_scope_;
+    j["show_waveform"] = show_waveform_;
     j["save_path"] = save_path_;
     j["csv_path"] = csv_path_;
     j["sel_dev_key"] = sel_dev_key_;
@@ -255,6 +276,9 @@ void App::load_settings() {
         max_window_msamples_ = j.value("max_window_msamples", max_window_msamples_);
         capture_ratio_ = j.value("capture_ratio", capture_ratio_);
         repeat_capture_ = j.value("repeat_capture", repeat_capture_);
+        show_scope_ = j.value("show_scope", show_scope_);
+        show_waveform_ = j.value("show_waveform", show_waveform_);
+        if (!show_scope_ && !show_waveform_) show_waveform_ = true;
         std::snprintf(save_path_, sizeof(save_path_), "%s",
                       j.value("save_path", std::string(save_path_)).c_str());
         std::snprintf(csv_path_, sizeof(csv_path_), "%s",
@@ -273,21 +297,34 @@ void App::load_settings() {
     }
 }
 
-// First data of a new capture arrived: NOW replace the previous capture.
+// First data of a new capture arrived: prepare storage for it.
 // Runs on the RX thread, before the data frame is appended.
+//
+// Scope-smooth repeat: when Repeat is cycling a triggered capture and the
+// display already has data, the new acquisition fills the HIDDEN buffer and
+// the display keeps the previous one untouched; the swap happens atomically
+// at CAPTURE_END. Otherwise (first capture, continuous mode, single shot)
+// live == fill and data streams progressively as before.
 void App::commit_pending_capture() {
     SessionMeta m;
     {
         std::lock_guard<std::mutex> lk(m_);
         m = pending_meta_;
     }
-    logic_.reset(m.unitsize ? m.unitsize : 1);
+    int live = live_idx_.load(std::memory_order_relaxed);
+    bool swap_mode = repeat_capture_ && run_active_.load() && pending_window_ == 0 &&
+                     bufs_[live]->logic.count() > bufs_[live]->logic.first_live();
+    fill_idx_ = swap_mode ? 1 - live : live;
+    swap_pending_ = swap_mode;
+    fill_meta_ = m;
+
+    logic_fill().reset(m.unitsize ? m.unitsize : 1);
     std::vector<int> bits;
     for (auto &ch : m.channels)
         if (ch.type == "logic" && ch.bit >= 0) bits.push_back(ch.bit);
-    logic_.set_tracked_bits(bits);
-    logic_.set_max_samples(pending_window_);
-    anns_.reset();
+    logic_fill().set_tracked_bits(bits);
+    logic_fill().set_max_samples(pending_window_);
+    anns_fill().reset();
     {
         // rebuild the display order: keep existing relative order, append new
         std::vector<int> order;
@@ -302,34 +339,76 @@ void App::commit_pending_capture() {
         }
         chan_order_ = std::move(order);
     }
+    bool first_data_ever;
     {
         std::lock_guard<std::mutex> lk(m_);
-        for (auto &kv : analog_map_) delete kv.second;
-        analog_map_.clear();
-        meta_ = m;
+        auto &am = bufs_[fill_idx_]->analog;
+        for (auto &kv : am) delete kv.second;
+        am.clear();
+        first_data_ever = !meta_valid_;
+        if (!swap_mode) {  // in swap mode the display keeps the old meta
+            meta_ = m;
+            meta_valid_ = true;
+        }
+    }
+    if (!swap_mode) {
+        // The frames buffered since SESSION_META become the new recording.
+        // (In swap mode this happens at the buffer swap instead, so Save keeps
+        // returning the acquisition that is actually on screen.)
+        std::lock_guard<std::mutex> lk(rec_m_);
+        record_ = std::move(pending_record_);
+        pending_record_.clear();
+        pending_rec_active_ = false;
+        record_truncated_ = false;
+        has_trigger_ = staged_has_trigger_;
+        trigger_sample_ = staged_trigger_;
+    }
+    ++acq_count_;
+    meta_pending_ = false;
+    user_view_touched_ = false;
+    // Taking new data must NOT reset the user's zoom/position: auto-fit only
+    // the very first time data appears in this session.
+    if (first_data_ever) need_view_reset_ = true;
+}
+
+// CAPTURE_END in swap mode: publish the freshly filled buffer to the display
+// in one atomic step — the scope "refresh" moment. RX thread only.
+void App::swap_buffers_on_end() {
+    if (!swap_pending_) return;
+    swap_pending_ = false;
+    if (logic_fill().count() == 0) return;  // nothing arrived: keep old display
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        meta_ = fill_meta_;
         meta_valid_ = true;
     }
     {
-        // The frames buffered since SESSION_META become the new recording.
         std::lock_guard<std::mutex> lk(rec_m_);
         record_ = std::move(pending_record_);
         pending_record_.clear();
         pending_rec_active_ = false;
         record_truncated_ = false;
     }
-    meta_pending_ = false;
-    user_view_touched_ = false;
-    need_view_reset_ = true;
+    has_trigger_ = staged_has_trigger_;
+    trigger_sample_ = staged_trigger_;
+    live_idx_.store(fill_idx_, std::memory_order_release);
 }
 
-AnalogStore *App::analog_get(uint32_t id, bool create) {
+AnalogStore *App::analog_get(uint32_t id) {
     std::lock_guard<std::mutex> lk(m_);
-    auto it = analog_map_.find(id);
-    if (it != analog_map_.end()) return it->second;
-    if (!create) return nullptr;
+    auto &m = bufs_[live_idx_.load(std::memory_order_acquire)]->analog;
+    auto it = m.find(id);
+    return it != m.end() ? it->second : nullptr;
+}
+
+AnalogStore *App::analog_fill_get(uint32_t id) {
+    std::lock_guard<std::mutex> lk(m_);
+    auto &m = bufs_[fill_idx_]->analog;
+    auto it = m.find(id);
+    if (it != m.end()) return it->second;
     AnalogStore *a = new AnalogStore();
     a->reset();
-    analog_map_[id] = a;
+    m[id] = a;
     return a;
 }
 
@@ -382,6 +461,7 @@ void App::do_disconnect() {
     if (rx_thread_.joinable()) rx_thread_.join();
     connected_ = false;
     capturing_ = false;
+    run_active_ = false;
     conn_state_ = 0;
     conn_lost_ = false;  // explicit disconnect: no auto-reconnect
 }
@@ -429,8 +509,10 @@ void App::process_rx_message(son_msg &msg) {
         if (t == SON_MSG_TRIGGER) {
             try {
                 json j = json::parse(msg.json());
-                trigger_sample_ = j.value("sample", (uint64_t)0);
-                has_trigger_ = true;
+                // Stage it: published at commit (progressive) or swap (repeat),
+                // so the marker always belongs to the acquisition on screen.
+                staged_trigger_ = j.value("sample", (uint64_t)0);
+                staged_has_trigger_ = true;
             } catch (...) {}
             return;
         }
@@ -443,16 +525,16 @@ void App::process_rx_message(son_msg &msg) {
                 size_t need = (size_t)h.sample_count * h.unitsize;
                 if (msg.payload.size() >= sizeof(son_logic_hdr) + need) {
                     bool disc = (msg.hdr.flags & SON_FLAG_DISCONTINUITY) != 0;
-                    logic_.append(h.start_sample, h.sample_count,
-                                  msg.payload.data() + sizeof(son_logic_hdr), disc);
-                    if (pending_window_ == 0 && capturing_ && logic_.full()) {
+                    logic_fill().append(h.start_sample, h.sample_count,
+                                        msg.payload.data() + sizeof(son_logic_hdr), disc);
+                    if (pending_window_ == 0 && capturing_ && logic_fill().full()) {
                         // Unbounded continuous capture reached the 2^32-sample
                         // store capacity: stop honestly instead of dropping.
                         log("sample store full (2^32) — stopping capture");
                         client_.send_empty(SON_MSG_STOP);
                     }
                     if (pending_window_)
-                        anns_.trim_before(logic_.first_live());
+                        anns_fill().trim_before(logic_fill().first_live());
                 }
             }
             return;
@@ -465,7 +547,7 @@ void App::process_rx_message(son_msg &msg) {
                 std::memcpy(&h, msg.payload.data(), sizeof(h));
                 size_t need = (size_t)h.sample_count * sizeof(float);
                 if (msg.payload.size() >= sizeof(son_analog_hdr) + need) {
-                    AnalogStore *as = analog_get(h.channel_id, true);
+                    AnalogStore *as = analog_fill_get(h.channel_id);
                     as->append(h.start_sample, h.sample_count,
                                (const float *)(msg.payload.data() + sizeof(son_analog_hdr)));
                 }
@@ -497,7 +579,7 @@ void App::process_rx_message(son_msg &msg) {
                         an.texts.emplace_back((const char *)msg.payload.data() + off, len);
                         off += len;
                     }
-                    anns_.add(bh.decode_stack_id, bh.row_id, an);
+                    anns_fill().add(bh.decode_stack_id, bh.row_id, an);
                     if (!ok) break;
                 }
             }
@@ -510,11 +592,10 @@ void App::process_rx_message(son_msg &msg) {
                 // Armed capture ended with zero data (trigger never fired /
                 // timeout / error): the previous capture is untouched.
                 log("capture ended with no data — previous capture kept");
-            } else if (!user_view_touched_.load()) {
-                // Fit the completed capture only if the user hasn't already
-                // panned/zoomed to a point of interest.
-                need_view_reset_ = true;
             }
+            swap_buffers_on_end();  // repeat mode: the scope "refresh" moment
+            // Deliberately no view reset here: the zoom/position carries over
+            // from capture to capture (View->Zoom to fit / F is explicit).
         }
 
         // Everything else goes to the main thread.
@@ -576,6 +657,23 @@ void App::process_ctrl() {
                             manual_rate_hz_ = p.value("manual_rate_hz", manual_rate_hz_);
                             if (chan_order_.empty() && p.contains("order"))
                                 for (auto &o : p["order"]) chan_order_.push_back(o.get<int>());
+                            if (p.contains("scope"))
+                                for (auto it = p["scope"].begin(); it != p["scope"].end(); ++it) {
+                                    ScopeChan &sc = scope_[std::stoi(it.key())];
+                                    sc.show = it.value().value("show", true);
+                                    sc.ac = it.value().value("ac", false);
+                                    sc.vdiv = it.value().value("vdiv", 1.0f);
+                                    sc.voff = it.value().value("voff", 0.0f);
+                                    sc.inited = true;  // don't auto-fit over saved scales
+                                }
+                            if (p.contains("scope_d"))
+                                for (auto it = p["scope_d"].begin(); it != p["scope_d"].end(); ++it) {
+                                    ScopeDig &sd = scope_d_[std::stoi(it.key())];
+                                    sd.show = it.value().value("show", true);
+                                    sd.pos = it.value().value("pos", 0.0f);
+                                    sd.size = it.value().value("size", 0.3f);
+                                    sd.inited = true;  // don't auto-stack over saved layout
+                                }
                         }
                     }
                     log("SCAN_RESULT: " + std::to_string(devices_.size()) + " device(s)");
@@ -605,15 +703,19 @@ void App::process_ctrl() {
                     if (!mm.empty()) capture_reason_ += ": " + mm;
                 } catch (...) { capture_reason_ = msg.json(); }
                 log("CAPTURE_END: " + capture_reason_);
-                // Auto re-arm: catch intermittent events without babysitting.
-                if (repeat_capture_ && reason == "complete" && connected_ &&
-                    !capturing_ && mode_idx_ == 0)
+                // Auto re-arm only while the user-level Run state is active —
+                // Stop between acquisitions reliably ends the cycle.
+                if (reason != "complete") run_active_ = false;  // terminal
+                if (repeat_capture_ && reason == "complete" && run_active_.load() &&
+                    connected_ && !capturing_ && mode_idx_ == 0)
                     start_capture();
+                else if (!repeat_capture_)
+                    run_active_ = false;  // single shot finished
                 break;
             }
             case SON_MSG_DECODE_END:
                 redecoding_ = false;
-                log("re-decode complete: " + std::to_string(anns_.total()) +
+                log("re-decode complete: " + std::to_string(anns().total()) +
                     " annotation(s)");
                 break;
             case SON_MSG_ERROR:
@@ -674,10 +776,13 @@ void App::apply_client_state(const std::string &js) {
         if (j.contains("macros"))
             for (auto &mc : j["macros"])
                 macros_.push_back({mc.value("name", std::string()), mc.value("expr", std::string())});
-        chan_names_.clear();
-        if (j.contains("channel_names"))
+        // Only adopt the file's channel names when it actually has some —
+        // loading an unnamed capture must not wipe the user's renames.
+        if (j.contains("channel_names") && !j["channel_names"].empty()) {
+            chan_names_.clear();
             for (auto it = j["channel_names"].begin(); it != j["channel_names"].end(); ++it)
                 chan_names_[std::stoi(it.key())] = it.value().get<std::string>();
+        }
     } catch (const std::exception &e) {
         log(std::string("client-state parse error: ") + e.what());
     }
@@ -752,7 +857,7 @@ int App::replay_and_report(const std::string &path, const std::string &export_ba
     std::printf("replay %s: samplerate=%llu unitsize=%u channels=%zu logic_samples=%llu "
                 "annotations=%zu markers=%zu macros=%zu renames=%zu\n",
                 path.c_str(), (unsigned long long)m.samplerate, (unsigned)m.unitsize,
-                m.channels.size(), (unsigned long long)logic_.count(), anns_.total(),
+                m.channels.size(), (unsigned long long)logic().count(), anns().total(),
                 markers_.size(), macros_.size(), chan_names_.size());
     for (auto &mk : markers_)
         std::printf("  marker %s @ %.0f\n", mk.name.c_str(), mk.sample);
@@ -772,7 +877,7 @@ int run_replay(const std::string &path, const std::string &export_base) {
 void App::start_redecode() {
     start_error_.clear();
     if (!connected_ || capturing_ || redecoding_.load()) return;
-    uint64_t fl = logic_.first_live(), total = logic_.count();
+    uint64_t fl = logic().first_live(), total = logic().count();
     if (total <= fl) { start_error_ = "no captured data to decode"; return; }
     if (decoders_.empty()) { start_error_ = "no decoders configured"; return; }
     for (auto &dec : decoders_) {
@@ -786,8 +891,8 @@ void App::start_redecode() {
         }
     }
     SessionMeta m = meta_copy();
-    int unitsize = logic_.unitsize() ? logic_.unitsize() : 1;
-    anns_.reset();
+    int unitsize = logic().unitsize() ? logic().unitsize() : 1;
+    anns().reset();
     redecoding_ = true;
 
     json req;
@@ -811,7 +916,7 @@ void App::start_redecode() {
         h.unitsize = (uint8_t)unitsize;
         std::memset(h._pad, 0, sizeof(h._pad));
         std::memcpy(buf.data(), &h, sizeof(h));
-        logic_.copy_raw(s, n, buf.data() + sizeof(h));
+        logic().copy_raw(s, n, buf.data() + sizeof(h));
         if (!son_send(client_.fd(), SON_MSG_DATA_LOGIC, 0, 1, buf.data(),
                       (uint32_t)buf.size())) {
             redecoding_ = false;
@@ -829,14 +934,14 @@ void App::update_measurements() {
     double a = markers_[markers_.size() - 2].sample;
     double b = markers_[markers_.size() - 1].sample;
     if (a > b) std::swap(a, b);
-    uint64_t cnt = logic_.count();
+    uint64_t cnt = logic().count();
     if (a == meas_.a && b == meas_.b && cnt == meas_.count) return;  // cached
     meas_.a = a; meas_.b = b; meas_.count = cnt;
     meas_.lines.clear();
 
     SessionMeta m = meta_copy();
     double sr = m.samplerate > 0 ? (double)m.samplerate : 1.0;
-    uint64_t lo = (uint64_t)std::max(a, (double)logic_.first_live());
+    uint64_t lo = (uint64_t)std::max(a, (double)logic().first_live());
     uint64_t hi = (uint64_t)std::min(b, (double)cnt);
     if (hi <= lo) return;
     double dt = (double)(hi - lo) / sr;
@@ -850,7 +955,7 @@ void App::update_measurements() {
         if (ch.type == "logic" && ch.bit >= 0) {
             std::vector<Edge> e;
             uint8_t init;
-            logic_.walk(ch.bit, lo, hi, 1.0, init, e, nullptr);
+            logic().walk(ch.bit, lo, hi, 1.0, init, e, nullptr);
             // integrate high time for duty cycle
             uint64_t high = 0, prev = lo;
             uint8_t cur = init;
@@ -866,7 +971,7 @@ void App::update_measurements() {
                           nm.c_str(), e.size(), freq, duty);
             meas_.lines.push_back(l);
         } else if (ch.type == "analog") {
-            AnalogStore *as = analog_get((uint32_t)ch.index, false);
+            AnalogStore *as = analog_get((uint32_t)ch.index);
             if (!as || as->count() <= lo) continue;
             uint64_t ahi = std::min<uint64_t>(hi, as->count());
             uint64_t stride = std::max<uint64_t>(1, (ahi - lo) / 200000);
@@ -912,6 +1017,7 @@ static uint64_t effective_rate(const DeviceInfo &d, int idx, bool manual, int ma
 
 void App::start_capture() {
     start_error_.clear();
+    run_active_ = false;  // re-set below only if the capture actually starts
     if (sel_dev_ < 0 || sel_dev_ >= (int)devices_.size()) return;
     DeviceInfo &d = devices_[sel_dev_];
     std::vector<int> channels;
@@ -953,14 +1059,22 @@ void App::start_capture() {
     std::string cfg = build_config(d.id, rate, channels, mode, limit, ratio, triggers, decoders_);
     if (!client_.send_json(SON_MSG_CONFIG, cfg)) { log("send CONFIG failed"); return; }
     if (!client_.send_empty(SON_MSG_START)) { log("send START failed"); return; }
+    run_active_ = true;
     capture_reason_.clear();
     log("capture started (" + mode + ", " + fmt_hz(rate) + ")");
     save_settings();  // the config that just worked is worth keeping
 }
 
+// User-level Stop: ends the acquisition run. Works no matter where the repeat
+// cycle currently is (armed, capturing, or between two captures).
 void App::stop_capture() {
-    client_.send_empty(SON_MSG_STOP);
-    log("stop requested");
+    run_active_ = false;
+    if (capturing_) {
+        client_.send_empty(SON_MSG_STOP);
+        log("stop requested");
+    } else {
+        log("run stopped");
+    }
 }
 
 // ---- panels -------------------------------------------------------------
@@ -982,7 +1096,10 @@ void App::draw_connection_panel() {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "connecting...");
     } else {
-        if (ImGui::Button("Connect")) do_connect();
+        if (ImGui::Button("Connect")) {
+            save_settings();  // remember the typed host/port right away
+            do_connect();
+        }
         ImGui::SameLine();
         if (conn_lost_.load())
             ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1),
@@ -1103,6 +1220,7 @@ void App::draw_device_panel() {
         std::snprintf(nm, sizeof(nm), "%s", chan_name(ch.index, ch.name).c_str());
         ImGui::SetNextItemWidth(96);
         if (ImGui::InputText("##nm", nm, sizeof(nm))) chan_names_[ch.index] = nm;
+        if (ImGui::IsItemDeactivatedAfterEdit()) save_settings();  // rename done
         ImGui::SameLine();
         ImGui::TextDisabled("(%s)", ch.type.c_str());
         if (ch.type == "logic" && d.triggers) {
@@ -1194,7 +1312,7 @@ void App::draw_decoder_panel() {
     // Post-hoc decode: run the configured stack over already-captured data
     // (works on loaded .son files too; needs a connected server).
     bool can_rd = connected_ && !capturing_ && !redecoding_.load() &&
-                  logic_.count() > logic_.first_live() && !decoders_.empty();
+                  logic().count() > logic().first_live() && !decoders_.empty();
     if (!can_rd) ImGui::BeginDisabled();
     if (ImGui::Button("Re-decode captured data")) start_redecode();
     if (!can_rd) ImGui::EndDisabled();
@@ -1263,34 +1381,50 @@ void App::draw_capture_panel() {
     ImGui::SetNextWindowPos(ImVec2(8, 730), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(400, 160), ImGuiCond_FirstUseEver);
     ImGui::Begin("Capture");
-    bool canStart = connected_ && sel_dev_ >= 0 && !capturing_;
-    if (capturing_) {
+    // Scope-style Run/Stop toggle: while a repeat run is active the button is
+    // ALWAYS "Stop" — it never flips back to "Start" between acquisitions, so
+    // a Stop click can't accidentally arm another capture.
+    bool running = capturing_ || run_active_.load();
+    bool canStart = connected_ && sel_dev_ >= 0;
+    if (running) {
         if (ImGui::Button("Stop")) stop_capture();
         ImGui::SameLine();
-        if (meta_pending_.load() && last_cfg_triggered_) {
+        if (capturing_ && meta_pending_.load() && last_cfg_triggered_) {
             // No data yet + a trigger is configured = we are armed and waiting.
             ImGui::TextColored(ImVec4(0.5f, 0.8f, 1, 1), "armed - waiting for trigger...");
-        } else {
+        } else if (capturing_ && swap_pending_) {
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "acquiring...");
+        } else if (capturing_) {
             SessionMeta m = meta_copy();
             if (m.total_samples > 0) {
-                float frac = (float)((double)logic_.count() / (double)m.total_samples);
+                float frac = (float)((double)logic().count() / (double)m.total_samples);
                 ImGui::ProgressBar(frac, ImVec2(-1, 0));
             } else {
                 ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "capturing (continuous)...");
             }
+        } else {
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "re-arming...");
+        }
+        if (repeat_capture_ && acq_count_ > 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("acq #%d", acq_count_);
         }
     } else {
         if (!canStart) ImGui::BeginDisabled();
-        if (ImGui::Button("Start")) start_capture();
+        if (ImGui::Button("Start")) {
+            acq_count_ = 0;
+            start_capture();
+        }
         if (!canStart) ImGui::EndDisabled();
         if (!canStart) {
             ImGui::SameLine();
             ImGui::TextDisabled(!connected_ ? "(not connected)" : "(no device selected)");
         }
-        ImGui::SameLine();
-        ImGui::Checkbox("Repeat", &repeat_capture_);
-        ImGui::SetItemTooltip("Automatically re-arm after each complete capture");
     }
+    ImGui::Checkbox("Repeat", &repeat_capture_);
+    ImGui::SetItemTooltip("Re-arm automatically after each complete capture.\n"
+                          "The display swaps seamlessly between acquisitions\n"
+                          "(no blink); Stop ends the run at any point.");
     if (!start_error_.empty())
         ImGui::TextColored(ImVec4(1, 0.45f, 0.45f, 1), "%s", start_error_.c_str());
     if (!capture_reason_.empty()) {
@@ -1300,8 +1434,8 @@ void App::draw_capture_panel() {
             ImGui::Text("last: %s", capture_reason_.c_str());
     }
     ImGui::Separator();
-    ImGui::Text("logic samples: %llu", (unsigned long long)logic_.count());
-    ImGui::Text("annotations:   %zu", anns_.total());
+    ImGui::Text("logic samples: %llu", (unsigned long long)logic().count());
+    ImGui::Text("annotations:   %zu", anns().total());
     ImGui::Checkbox("Follow newest", &follow_);
 
     ImGui::SeparatorText("Capture file (.son)");
@@ -1381,7 +1515,7 @@ void App::draw_decoded_panel() {
     }
 
     // Rebuild the cache lazily (and throttled while a live decode is growing).
-    size_t tot = anns_.total();
+    size_t tot = anns().total();
     if (--table_cooldown_ < 0) table_cooldown_ = 0;
     if ((tot != table_total_seen_ && table_cooldown_ == 0) || filter_changed) {
         table_total_seen_ = tot;
@@ -1389,7 +1523,7 @@ void App::draw_decoded_panel() {
         table_cache_.clear();
         std::string f = table_filter_;
         for (auto &c : f) c = (char)tolower((unsigned char)c);
-        anns_.for_each([&](uint32_t stack, uint16_t row, const Annotation &a) {
+        anns().for_each([&](uint32_t stack, uint16_t row, const Annotation &a) {
             const std::string &txt = a.texts.empty() ? std::string() : a.texts.front();
             if (!f.empty()) {
                 std::string hay = txt;
@@ -1442,7 +1576,7 @@ bool App::export_annotations_csv(const std::string &path, std::string &err) {
     if (!f) { err = "cannot open " + path; return false; }
     double sr = render_sr_ > 0 ? render_sr_ : 1.0;
     std::fprintf(f, "start_s,end_s,start_sample,end_sample,stack,row,text\n");
-    anns_.for_each([&](uint32_t stack, uint16_t row, const Annotation &a) {
+    anns().for_each([&](uint32_t stack, uint16_t row, const Annotation &a) {
         std::string txt = a.texts.empty() ? std::string() : a.texts.front();
         for (auto &c : txt)
             if (c == '"') c = '\'';
@@ -1565,7 +1699,7 @@ void App::draw_menu_bar() {
         std::string base = save_path_;
         size_t dot = base.rfind(".son");
         if (dot != std::string::npos) base.resize(dot);
-        bool have_data = logic_.count() > logic_.first_live();
+        bool have_data = logic().count() > logic().first_live();
         if (ImGui::MenuItem("Export VCD (logic)", nullptr, false, have_data)) {
             std::string p = base + ".vcd", e;
             if (export_vcd(p, e)) log("exported " + p);
@@ -1584,6 +1718,14 @@ void App::draw_menu_bar() {
         if (ImGui::MenuItem("Zoom to fit", "F")) {
             view_fit(last_canvas_w_);
             follow_ = false;
+        }
+        // Pick your instrument: waveform (time view), scope, or both — but
+        // never neither.
+        if (ImGui::MenuItem("Waveform view", nullptr, &show_waveform_)) {
+            if (!show_waveform_ && !show_scope_) show_scope_ = true;
+        }
+        if (ImGui::MenuItem("Scope view", nullptr, &show_scope_)) {
+            if (!show_scope_ && !show_waveform_) show_waveform_ = true;
         }
         if (ImGui::MenuItem("Reset window layout")) layout_reset_ = true;
         ImGui::EndMenu();
@@ -1665,7 +1807,7 @@ void App::autopilot_step() {
             ap_wait_ = 20;
             break;
         case 3:  // after capture: drop two close markers, macros, and zoom to ns
-            if (!capturing_ && logic_.count() > 2000) {
+            if (!capturing_ && logic().count() > 2000) {
                 markers_.push_back({1000.0, "m1"});
                 markers_.push_back({1002.0, "m2"});  // 2 samples = 500 ns @ 4 MHz
                 marker_seq_ = 2;
@@ -1706,6 +1848,79 @@ void App::autopilot_step() {
             if (redecoding_.load()) ap_wait_ = 10;
             else ap_phase_ = 8;
             break;
+        case 8:  // end on a medium zoom where analog waves are visible
+            view_start_ = 600;
+            spp_ = 0.6;
+            view_init_ = true;
+            follow_ = false;
+            ap_phase_ = 9;
+            ap_wait_ = 10;
+            break;
+        case 9:  // take a SECOND capture: the zoom must survive it
+            start_capture();
+            ap_phase_ = 10;
+            ap_wait_ = 30;
+            break;
+        case 10:
+            if (capturing_ || meta_pending_.load()) {
+                ap_wait_ = 10;
+            } else {
+                char b[128];
+                std::snprintf(b, sizeof(b),
+                              "zoom across recapture: start=%.0f spp=%.2f (%s)",
+                              view_start_, spp_,
+                              (view_start_ == 600.0 && spp_ == 0.6) ? "PRESERVED" : "RESET!");
+                log(b);
+                ap_phase_ = 11;
+            }
+            break;
+        case 11:  // repeat-mode smoke test: run a few acquisitions...
+            repeat_capture_ = true;
+            acq_count_ = 0;
+            // trigger + pre-trigger so the scope's draggable T flag is active
+            if (sel_dev_ >= 0 && sel_dev_ < (int)devices_.size())
+                for (auto &ch : devices_[sel_dev_].channels)
+                    if (ch.type == "logic" && ch.index == 0) ch.trigger = "rising";
+            capture_ratio_ = 30;
+            start_capture();
+            ap_phase_ = 12;
+            ap_wait_ = 30;
+            break;
+        case 12:  // ...then Stop mid-cycle (must end the run reliably)
+            if (acq_count_ < 4 && run_active_.load()) {
+                ap_wait_ = 15;
+            } else {
+                stop_capture();
+                log("autopilot: repeat ran " + std::to_string(acq_count_) +
+                    " acquisitions, stopped");
+                repeat_capture_ = false;
+                ap_phase_ = 13;
+                ap_wait_ = 90;
+            }
+            break;
+        case 13:  // verify the cycle really ended and the view never moved
+            log(std::string("autopilot: after stop, running=") +
+                ((capturing_ || run_active_.load()) ? "YES (BUG)" : "no") +
+                ", acq=" + std::to_string(acq_count_) +
+                (view_start_ == 600.0 && spp_ == 0.6 ? ", view steady" : ", VIEW MOVED"));
+            // show the whole CONFIGURED acquisition span (not just delivered
+            // samples) so the trigger-position flag at ratio% is on screen
+            view_start_ = 0;
+            spp_ = std::max(1.0, (double)meta_copy().total_samples / (double)last_canvas_w_);
+            view_init_ = true;
+            {
+                bool any_trig = false;
+                if (sel_dev_ >= 0 && sel_dev_ < (int)devices_.size())
+                    for (auto &ch : devices_[sel_dev_].channels)
+                        if (ch.enabled && ch.trigger != "none" && !ch.trigger.empty())
+                            any_trig = true;
+                log("autopilot trigflag: mode=" + std::to_string(mode_idx_) +
+                    " any_trig=" + std::to_string(any_trig) +
+                    " ratio=" + std::to_string(capture_ratio_) +
+                    " total=" + std::to_string(meta_copy().total_samples));
+            }
+            ap_phase_ = 14;
+            break;
         default:
             break;  // done
     }
@@ -1719,6 +1934,13 @@ void App::draw_ui() {
         connect_requested_ = false;
         do_connect();
     }
+    // a successful connect is worth remembering (host/port/device prefs)
+    if (connected_ && !ui_was_connected_) {
+        ui_was_connected_ = true;
+        save_settings();
+    } else if (!connected_) {
+        ui_was_connected_ = false;
+    }
     // auto-reconnect after an unexpected loss (~3 s between attempts)
     if (conn_lost_.load() && auto_reconnect_ && !connected_ && conn_state_.load() != 1) {
         if (--reconnect_cooldown_ <= 0) {
@@ -1730,8 +1952,12 @@ void App::draw_ui() {
     // Space = start/stop (when not typing into a field)
     ImGuiIO &io = ImGui::GetIO();
     if (!io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-        if (capturing_) stop_capture();
-        else if (connected_ && sel_dev_ >= 0) start_capture();
+        if (capturing_ || run_active_.load()) {
+            stop_capture();
+        } else if (connected_ && sel_dev_ >= 0) {
+            acq_count_ = 0;
+            start_capture();
+        }
     }
 
     autopilot_step();
@@ -1743,7 +1969,8 @@ void App::draw_ui() {
     draw_markers_panel();
     draw_measure_panel();
     draw_decoded_panel();
-    draw_canvas_panel();
+    if (show_waveform_) draw_canvas_panel();
+    if (show_scope_) draw_scope_panel();
     draw_log_panel();
 }
 

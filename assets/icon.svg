@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- sonview taskbar icon: a logic trace with a marker, on the app's dark canvas -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2230"/>
+      <stop offset="1" stop-color="#12141c"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="62" height="62" rx="13" fill="url(#bg)" stroke="#3a4152" stroke-width="2"/>
+  <!-- marker line (behind the trace) -->
+  <line x1="41" y1="8" x2="41" y2="56" stroke="#ff7a3c" stroke-width="3.5"/>
+  <path d="M35 8 H47 L41 16 Z" fill="#ff7a3c"/>
+  <!-- square-wave logic trace -->
+  <path d="M7 44 H17 V20 H29 V44 H41 V20 H57" fill="none" stroke="#5ce08a"
+        stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

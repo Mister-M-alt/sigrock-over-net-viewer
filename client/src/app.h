@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -95,6 +96,7 @@ private:
     bool auto_reconnect_ = true;
     int reconnect_cooldown_ = 0;           // frames until next attempt
     bool connect_requested_ = false;
+    bool ui_was_connected_ = false;        // rising-edge save of host/port
     std::string conn_err_;                 // guarded by m_
 
     // deferred capture start: nothing is wiped until the first data arrives, so
@@ -104,6 +106,7 @@ private:
     uint64_t pending_window_ = 0;          // rolling window to apply at commit
     bool last_cfg_triggered_ = false;      // capture was armed with a trigger
     void commit_pending_capture();         // RX thread, at first data
+    void swap_buffers_on_end();            // RX thread, at CAPTURE_END
 
     // trigger-fired marker (SON_MSG_TRIGGER)
     std::atomic<bool> has_trigger_{false};
@@ -114,10 +117,41 @@ private:
     SessionMeta meta_;
     bool meta_valid_ = false;
 
-    LogicStore logic_;
-    std::map<uint32_t, AnalogStore *> analog_map_;  // guarded by m_ (structure)
-    AnnotationStore anns_;
-    AnalogStore *analog_get(uint32_t channel_id, bool create);  // under m_
+    // Capture storage is double-buffered, like a scope's acquisition memory:
+    // in Repeat mode the next acquisition fills the hidden buffer while the
+    // display keeps showing the previous one, and the buffers swap atomically
+    // at CAPTURE_END — no blink, no half-drawn traces. Outside Repeat mode
+    // live == fill and data streams progressively exactly as before.
+    struct CaptureBuf {
+        LogicStore logic;
+        std::map<uint32_t, AnalogStore *> analog;  // guarded by m_ (structure)
+        AnnotationStore anns;
+    };
+    std::unique_ptr<CaptureBuf> bufs_[2];  // heap: LogicStore is ~0.5 MB
+    std::atomic<int> live_idx_{0};         // render thread reads this buffer
+    int fill_idx_ = 0;                     // RX thread writes this buffer
+    bool swap_pending_ = false;            // RX-owned: swap at CAPTURE_END
+    SessionMeta fill_meta_;                // RX-owned: published at swap
+    uint64_t staged_trigger_ = 0;          // RX-owned trigger of the fill capture
+    bool staged_has_trigger_ = false;
+
+    LogicStore &logic() { return bufs_[live_idx_.load(std::memory_order_acquire)]->logic; }
+    const LogicStore &logic() const {
+        return bufs_[live_idx_.load(std::memory_order_acquire)]->logic;
+    }
+    AnnotationStore &anns() { return bufs_[live_idx_.load(std::memory_order_acquire)]->anns; }
+    const AnnotationStore &anns() const {
+        return bufs_[live_idx_.load(std::memory_order_acquire)]->anns;
+    }
+    LogicStore &logic_fill() { return bufs_[fill_idx_]->logic; }
+    AnnotationStore &anns_fill() { return bufs_[fill_idx_]->anns; }
+    AnalogStore *analog_get(uint32_t channel_id);        // live, read-only, under m_
+    AnalogStore *analog_fill_get(uint32_t channel_id);   // fill, creates, under m_
+
+    // scope-style run state: true from Start until Stop / terminal end, so the
+    // Run/Stop button never flip-flops between repeat acquisitions.
+    std::atomic<bool> run_active_{false};
+    int acq_count_ = 0;  // acquisitions since Start (shown in the Capture panel)
 
     // connection UI
     char host_[256] = "127.0.0.1";
@@ -165,6 +199,10 @@ private:
     bool view_init_ = false;
     std::atomic<bool> user_view_touched_{false};  // pan/zoom since capture start
     float last_canvas_w_ = 1000.0f;
+    // While a capture is streaming in, clamp the view against the EXPECTED
+    // total so a held zoom position isn't dragged back to sample 0 before the
+    // data reaches it. 0 = clamp by received data only.
+    double view_total_hint_ = 0;
     // markers (N named vertical markers) + macros (expressions over marker times)
     struct Marker { double sample; std::string name; };
     std::vector<Marker> markers_;
@@ -237,6 +275,30 @@ private:
     // channel display order (per capture; persisted per device)
     std::vector<int> chan_order_;
     std::vector<const ChannelInfo *> ordered_channels(const SessionMeta &m) const;
+
+    // oscilloscope view: analog channels on a shared graticule, per-channel
+    // vertical scale/offset like a bench scope (persisted per device)
+    struct ScopeChan {
+        bool show = true;
+        bool ac = false;       // AC coupling: subtract the visible-window mean
+        bool inited = false;   // auto-fit once when data first appears
+        float vdiv = 1.0f;     // volts per division
+        float voff = 0.0f;     // voltage at the vertical center
+    };
+    std::map<int, ScopeChan> scope_;
+    // digital channels on the scope (MSO style): position + size in divisions
+    struct ScopeDig {
+        bool show = true;
+        bool inited = false;   // auto-stacked once on first draw
+        float pos = 0.0f;      // low level, in divisions above center
+        float size = 0.3f;     // trace height, in divisions
+    };
+    std::map<int, ScopeDig> scope_d_;
+    bool show_scope_ = true;
+    bool show_waveform_ = true;     // at least one of the two stays visible
+    bool scope_trig_drag_ = false;  // dragging the trigger-position flag
+    void draw_scope_panel();   // render.cpp
+    void scope_autofit(int chan_index, ScopeChan &sc);
 };
 
 }  // namespace son
