@@ -1,0 +1,19 @@
+# build trees
+/build/
+/build-pi/
+
+# local Pi sysroot used for cross-compiling (large; regenerate with scripts/make-sysroot.sh)
+/.pi-sysroot/
+
+# editor / os
+*.o
+*.swp
+.cache/
+compile_commands.json
+
+# local git identity prep + assistant settings
+.gitprep
+.claude/
+
+# imgui layout state
+imgui.ini
